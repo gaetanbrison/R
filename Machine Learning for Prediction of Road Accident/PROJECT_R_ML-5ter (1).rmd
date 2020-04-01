@@ -1,0 +1,639 @@
+---
+title: "R PROJECT"
+author: "Thomas Clamagirand/Dan Cemachovic/Gaëtan Brison/Selma Benlouhidy"
+date: "05/12/2019"
+output: html_document
+---
+
+
+#1.Pratical problem
+
+Reduce the number of severe road accidents by understanding which factors can influence the gravity of these accidents. 
+
+The dataset comes from the French government database :  (https://www.data.gouv.fr/fr/datasets/base-de-donnees-accidents-corporels-de-la-circulation)
+The goal here is to understand what can be done in terms of road safety, road configuration, vehicle designs and functionalities in order to minimize the risk of death in accidents
+For the purpose of our project, we will focus only on July 2018 accidents.
+
+#2.Mathematical problem
+
+the problem is to explain the Y variable (binary variable stating if the person involved in the accident is injured/dead or not)  by the other variables:
+
+We consider the categorical vrariable :
+$$Y=\left\{
+\begin{array}{ll}
+1 & \text{if the person involved is hospitalised or dead} \\
+0 & \text{otherwise,}
+\end{array}\right.$$
+
+col: type of collision
+1 two vehicles frontal
+2 two vehicles from behind 
+3 two vehicles from the side 
+4 three vehicles or more - in a row
+5 three vehicles or more -multiple collision 
+6 other collision 
+7 without collision
+
+
+int: type of intersection
+
+1 off intersection
+2 X intersection
+3 T intersection
+4 Y intersection
+5 Intersection with more than 4 roads
+6 roundabout
+7 square
+8 railroad crossing
+9 other intersection
+
+atm: atmospheric conditions
+
+1 Normal
+2 light rain
+3 heavy rain
+4 snow
+5 fog
+6 heavy wind
+7 very sunny 
+8 cloudy weather
+9 other
+
+catr: road category:
+
+1 highway
+2 national road
+3 departmental road
+4 communal road
+5 outside public track
+6 parking lot
+9 other
+
+catv2: vehicule category
+
+1 light vehicle
+2 truck
+3 scooter
+4 bike
+5 other
+
+choc: initial impact position
+1 front
+2 front-right
+3 front-left
+4 back
+5 back-right
+6 back-left
+7 right side
+8 left side
+9 multiple impacts
+
+sexe: sex of the user 
+1 male
+2 female
+
+age: age of the user
+
+hour_period : Time period of the accident
+1 Between 0:00 and 4:00 Am
+2 Between 4:00 and 8:00 Am
+3 Between 8:00 and 12:00 Am
+4 Between 12:00 and 16:00 Pm
+5 Between 16:00 and 20:00 Pm
+6 Between 20:00 and 24:00 Pm
+
+
+
+day_number : Number of the week's day
+1 Monday
+2 Tuesday
+3 Wednesday
+4 Thursday
+5 Friday
+6 Saturday
+7 Sunday
+
+driver: user behind the wheel
+1 yes
+2 no->passenger
+
+
+
+
+## Importation of the required libraries.
+```{r include=FALSE}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(sf)
+library(glmnet)
+library(caret)
+library(pROC)
+library(plotROC)
+library(ranger)
+library(Amelia)
+library(leaflet)
+library(leaps)
+library(mapdeck)
+```
+
+
+# I- Database Creation and Clean-up.
+```{r}
+
+#data import
+#setwd("~/datasets")
+caracteristiques=read.csv('datasets/carac.csv',na.strings=c('NA',''))
+lieux=read.csv('datasets/lieux.csv',na.strings=c('NA',''))
+usagers=read.csv('datasets/usagers.csv',na.strings=c('NA',''))
+vehicules=read.csv('datasets/vehicules.csv',na.strings=c('NA',''))
+
+#merging data
+data1=left_join(caracteristiques,lieux,by=c('Num_Acc'='Num_Acc'))
+data2=left_join(usagers,vehicules,by=c('Num_Acc'='Num_Acc','num_veh'='num_veh'))
+data=left_join(data2,data1,by=c('Num_Acc'='Num_Acc'))
+
+
+#filter on mainland france
+data = data %>% filter(dep < 970) #exclusion territoire d'outre mer
+
+
+#create the output variable : if user hospitalized or dead = 1, else = 0
+data = data %>% mutate(Y = ifelse(between(grav,2,3),1,0)) %>% select(-grav)
+
+
+#create age column
+data = data %>% mutate(age=2018-an_nais) %>% select(-an_nais)
+
+#transform hour into a period
+data=data %>% mutate(hour_period=ifelse(between(hrmn,0,399),1,
+                                   ifelse(between(hrmn,400,799),2,
+                                            ifelse(between(hrmn,800,1199),3,
+                                               ifelse(between(hrmn,1200,1599),4,
+                                                  ifelse(between(hrmn,1600,1999),5,
+                                                      ifelse(between(hrmn,2000,2399),6,0))))))) %>% select(-hrmn)
+
+#create day of the week number columns and filtering on July
+data = data %>% 
+  mutate(jour = ifelse(nchar(jour)==1,paste("0",jour,sep=""),jour),
+         mois = ifelse(nchar(mois)==1,paste("0",mois,sep=""),mois)) %>%
+  unite("date",c(jour,mois,an),sep="/")
+
+data = data %>%  
+  mutate(date = as.Date(date,format = "%d/%m/%y"),
+         day_number = strftime(data$date,format = '%u'),
+         month_number = strftime(data$date,format = '%m')) %>%
+  filter(month_number=="07")
+  
+  
+#synthesize car category 
+data = data %>% mutate(catv2 = ifelse(catv == 7,1,
+                                      ifelse(between(catv,13,15),2,
+                                             ifelse(catv %in% c(2,5,4,31,32,33,34),3,
+                                                    ifelse(catv == 1,4,5))))) %>%
+  select(-catv)
+
+#create driver column
+data = data %>% mutate(driver = ifelse(place == 1,1,0)) %>% select(-place)
+data$driver[is.na(data$driver)] = 0
+
+
+#select only relevant columns
+data = data %>% select(Y,col,int,atm,catr,catv2,choc,sexe,age,hour_period,day_number,driver,dep,lat,long)
+
+  
+#make categorical variables
+data$sexe=as.factor(data$sexe)
+data$catv2=as.factor(data$catv2)
+data$choc=as.factor(data$choc)
+data$int=as.factor(data$int)
+data$atm=as.factor(data$atm)
+data$col=as.factor(data$col)
+data$catr=as.factor(data$catr)
+data$hour_period=as.factor(data$hour_period)
+data$day_number=as.factor(data$day_number)
+data$driver = as.factor(data$driver)
+```
+
+
+## Check missingness in data
+```{r}
+
+missmap(data,col=c('yellow','red'))
+
+```
+Almost no missing values in the dataset (around 0%)
+
+
+
+
+
+# II- Data Explanation and Visualization
+
+## Map of the number of deaths and injured per region
+```{r}
+#polygon data of regions
+
+mymap = st_read("datasets/departements-20140306-100m.shx")
+
+#creation of data frame of number of deaths by region
+data2 = data %>% 
+  filter(Y==1) %>% 
+  group_by(dep) %>% 
+  summarize(deaths = n()) %>%
+  ungroup() %>%
+  mutate(code = round(dep/10)) %>%
+  mutate(code2 = ifelse(nchar(code)==1,paste("0",code,sep=""),code)) %>%
+  select(-code,-dep) 
+  
+colnames(data2)[2]="code_insee"
+map_and_data = inner_join(mymap,data2)
+
+
+#Main cities coordinates
+city = c("Lille","Paris","Nice","Lyon","Bordeaux","Marseille","Rennes","Strasbourg")
+x = c(3.058033,2.349332,7.280967,4.837865,-0.575843,5.355769,-1.676782,7.755226)
+y = c(50.630564,48.858245,43.701432,45.757695,44.841802,43.287803,48.110294,48.577270)
+points = data.frame(city,x,y)
+
+
+
+ggplot(map_and_data) +
+  geom_sf(aes(fill=deaths)) +
+  scale_fill_continuous(low="yellow",high="red") +
+  theme_bw() +
+  ggtitle("Number of people injured and dead on the roads in July 2018") +
+  theme(axis.text = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  geom_point(data = points,aes(y=y,x=x)) +
+  geom_text(data=points,aes(y=y - 0.2,x=x,label=city),size=3) +
+  labs(x="",y="",fill = "")
+  
+
+```
+
+
+## Histogram of the top 5 regions with the most deaths/injured in July 2018
+```{r}
+
+data_histogram = data.frame(dep = map_and_data$nom,deaths = map_and_data$deaths)
+top5 = data_histogram %>% arrange(desc(deaths)) %>% slice(1:5)
+
+
+
+top5$dep = as.character(top5$dep)
+top5[1,1] = "Bouches-du-Rhones"
+top5[3,1] = "Herault"
+
+
+ggplot(top5) + 
+  aes(x=reorder(dep,deaths),y=deaths,fill=deaths) + 
+  geom_bar(stat='identity',show.legend = FALSE,width = 0.6) +
+  coord_flip() + 
+  ggtitle("Top 5 regions with the most deaths/injured in July 2018") +
+  scale_fill_continuous(low="orange",high="red") +
+  labs(x="",y="") + 
+  theme(plot.title = element_text(face="bold"),
+        panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+  
+```
+
+## Histogram of the bottom 5 regions of the most deaths/injured in July 2018.
+```{r}
+bottom5 = data_histogram %>% arrange(deaths) %>% slice(1:5)
+
+
+bottom5$dep = as.character(bottom5$dep)
+bottom5[2,1] = "Lozere"
+bottom5[1,1] = "Ariege"
+bottom5[5,1] = "Correze"
+
+ggplot(bottom5) + 
+  aes(x=reorder(dep,deaths),y=deaths,fill=deaths) + 
+  geom_bar(stat='identity',show.legend = FALSE,width = 0.6) +
+  ggtitle("Bottom 5 regions of the most deaths/injured in July 2018.") +
+  scale_fill_continuous(low="yellow",high="darkgoldenrod1") +
+  labs(x="",y="") + 
+  theme(plot.title = element_text(face="bold"),
+        panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  coord_flip(ylim=c(0,max(top5$deaths)))
+
+```
+## Interactive map displaying the concentration and exact localization of accidents
+```{r}
+ndata= data%>%mutate(lat=lat/100000,long=long/100000)
+ndata=ndata%>%filter(long<=9.90000)
+
+plot2=leaflet(data = ndata) %>% addTiles(urlTemplate = "http://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png") %>%
+  addCircleMarkers(~long, ~lat,radius=5,stroke=FALSE,fillOpacity=1.5,popup=~Y,clusterOptions = markerClusterOptions())
+plot2
+
+```
+
+## Lolipop Graph displaying the Weekly Seasonality of the road accidents 
+```{r}
+
+# to change with the seasonality within the week weekdays
+day_bar_data = data %>% group_by(day_number) %>% summarize(injuries = sum(Y))
+
+ggplot(day_bar_data) + aes(x=day_number,y=injuries,fill = injuries) +
+    geom_segment( aes(xend=day_number, yend=0), linetype="dotdash")+ 
+  scale_x_discrete(name = "",labels = c("Lundi","Mardi","Mercredi","Jeudi","Vendredi","Samedi","Dimanche")) +
+    geom_point( size=5,color="red", fill=alpha("orange", 0.3), alpha=0.7, shape=21, stroke=2) +
+    coord_flip() +
+    theme_bw() +
+    xlab("") +
+    labs( title ="Weekly Seasonality of the N° of People Injured and Dead on The Roads")
+
+```
+
+
+
+
+
+
+
+## Distribution of accidents per age and sexe of driver.
+```{r}
+ggplot(na.omit(data) %>% filter(driver==1)) + aes(age,fill=sexe) + 
+  geom_density(position = "stack") +
+  theme_classic() +
+  scale_fill_discrete(name = "Sexe",labels = c("Male","Female")) + 
+  labs(title = 'Distribution of accidents per age and sexe of driver')
+
+```
+## Histogram of the number of people injured and dead on the roads by time period.
+```{r}
+
+hour_period_graph = data %>% group_by(hour_period) %>% summarize(number_injured = sum(Y))
+
+ggplot(hour_period_graph) + aes(x=hour_period,y=number_injured,fill = number_injured) +
+  geom_bar(stat="identity",show.legend=FALSE) + 
+  scale_x_discrete(name = "Time period",labels = c("0h - 4h","4h - 8h","8h - 12h","12h - 16h","16h - 20h","20h - 24h")) +
+  theme_classic() +
+  labs(y="", title ="Number of people injured and dead on the roads by time period") +
+  scale_fill_continuous(low="yellow",high="red")
+
+
+```
+
+
+# III- Machine Learning
+
+## 1. Logistic model with all the variables and subsets selection
+
+We first consider the logistic model
+$$\log\frac{p(x)}{1-p(x)}=\beta_0+\beta_1x_1+\beta_2x_2+\beta_3x_3+\beta_4x_4+\beta_5x_5++\beta_6x_6+\beta_7x_7+\beta_8x_8+\beta_9x_9+\beta_10_x10$$
+
+We split the data into:
+- a training set of 70% of the dataset.
+- a test set of 30% of the dataset.
+
+```{r}
+#Fit a logistic model on the train dataset with all the variables.
+data_ML = data %>% select(Y,col,int,atm,catr,catv2,choc,sexe,age,hour_period,day_number,driver)
+
+data_ML = na.omit(data_ML)
+n= nrow(data_ML)
+
+perm <- sample(n)
+train <- data_ML[perm[1:round(n*0.7)],]
+test <- data_ML[perm[round(n*0.7):n],]
+
+train.X <- model.matrix(Y~.,data=train)
+test.X <- model.matrix(Y~.,data=test)
+full.logit <- glm(Y~.,data=train,family="binomial")
+
+summary(full.logit)
+
+```
+Regarding the output of the regression (p-values), it seems, that some variables are irrelevant to predict the model
+
+We propose to make a variable selection procedure with a backward selection approach using BIC criterion 
+
+this is the list of all the significant variables to explain our model:
+col: type of collision
+2 two vehicles from behind 
+3 two vehicles from the side 
+4 three vehicles or more - in a row
+5 three vehicles or more -multiple collision 
+
+
+
+int: type of intersection
+7 square
+
+
+atm: atmospheric conditions
+7 very sunny 
+
+
+catr: road category:
+3 departmental road
+4 communal road
+
+
+catv2: vehicule category
+3 scooter
+4 bike
+
+
+choc: initial impact position
+4 back
+5 back-right
+6 back-left
+
+
+sex is not significant
+
+age: age of the user is very significant
+
+hour_period : Time period of the accident
+3 Between 8:00 and 12:00 Am
+4 Between 12:00 and 16:00 Pm
+5 Between 16:00 and 20:00 Pm
+
+
+
+
+day_number : Number of the week's day is not significant
+
+driver: user behind the wheel
+1 yes
+
+
+
+## mod.back
+```{r}
+mod.back <- step(full.logit,direction="backward",k=log(nrow(train)),trace=0)
+summary(mod.back)
+```
+
+## 
+```{r}
+#calculate the error probabilities per method
+prev2.full <- predict(full.logit,newdata=test,type="response") %>% round() %>% as.factor()
+
+prev2.back <- predict(mod.back,newdata=test,type="response") %>% round() %>% as.factor()
+prev2 <- data.frame(full=prev2.full,back=prev2.back,Y=test$Y)
+
+prev2 %>% summarise_at(vars(1:2),~(mean((.!=Y)^2))) 
+
+```
+
+
+```{r}
+#to see which variable is useful and need to be taken into consideration
+
+ind.train2 <- perm[1:100]
+train2 <- data_ML[ind.train2,]
+mod.sel <- regsubsets(Y~.,data=train2,really.big = T)
+summary(mod.sel)
+
+plot(mod.sel,scale="bic")
+plot(mod.sel,scale="Cp")
+
+```
+
+Option 2 à vérifier ?:
+
+```{r}
+
+mod.sel2 <- regsubsets(Y~.,data=train2,method = "backward",nvmax = 30)
+a <- summary(mod.sel2)
+number <- order(a$bic)[1]
+var.sel <- a$which[number,][-1]
+var.sel1 <- names(var.sel)[var.sel] %>% paste(collapse="+")
+mod.back2 <- glm(Y~col+atm+choc,data=train,family = "binomial")
+print(var.sel1)# variables selected by the BIC model
+
+p.full <- predict(full.logit,newdata=test)
+p.step <- predict(mod.back2,newdata=test)
+
+pred.df <- data.frame(full=p.full,step=p.step,obs=test$Y)
+
+pred.df %>% summarise_at(1:2,~mean((obs-.)^2))
+
+#We notice that the selected model has smaller MSE than the full model. We can conclude that, regarding this criterion this model is better. 
+```
+
+
+The BIC selects : 
+
+$$Y=\beta_0+\beta_1col+\beta_2catv2+\beta_3choc+\beta_4daynumber$$
+
+While Mallows’s Cp selects :
+
+$$Y=\beta_0+\beta_1col+\beta_2catv2+\beta_3daynumber$$
+
+```{r}
+mod.cp <- glm(Y~col+catv2+day_number,data=train,family="binomial")
+mod.bic <- glm(Y~col+catv2+choc+day_number,data=train,family="binomial")
+
+prev <- data.frame(Y=test$Y,fullglm=predict(full.logit,newdata=test),BIC=predict(mod.bic,newdata=test),Cp=predict(mod.cp,newdata=test))
+
+prev %>% summarize(Err_fullglm=mean((Y-fullglm)^2),Err_BIC=mean((Y-BIC)^2),Err_Cp=mean((Y-Cp)^2))
+
+#The CP model has the smallest estimated quadratic error.
+```
+
+We consider the quadratic risk for these three models,this risk is estimated with the test set according to
+
+$$\frac{1}{n_{test}}\sum_{i\in test}(Y_i-\widehat m(X_i))^2.$$
+```{r}
+
+#ROC curve and AUC of the full logit model VS the CP model :
+Prev1 <- predict(full.logit,newdata=test,type="response")
+Prev2 <- predict(mod.cp,newdata=test,type="response")
+df <- data.frame(full_logistic=Prev1,CP_model=Prev2,obs=as.numeric(test$Y)-1)
+
+# Roc curve of the two Scores
+
+df1 <- df %>% gather(key="Score",value="value",-obs)
+ggplot(df1)+aes(d=obs,m=value,color=Score)+geom_roc()+theme_classic()
+
+# AUC
+
+df1 %>% group_by(Score) %>% summarize(AUC=auc(obs,value)) %>% arrange(desc(AUC))
+
+#The full logistic model gets the best AUC howevers the 2 values are very close.
+```
+
+2. Penalized regression with Lasso, Ridge methods
+
+We have seen that when there are noisy variables in a model, variance of least square estimate increases. These estimates are thus less accurate. To circumvent this problem, we have to select variables (as we did here with the regsubset function). We can also use regularized methods such as Lasso and Ridge which can be intersting for large dataset like ours.
+
+```{r}
+
+
+data_ML_X = model.matrix(Y~.,data=data_ML)[,-1]
+data_ML_Y = as.numeric(data_ML[,'Y'])
+
+
+#cross validation
+
+folds <- createFolds(1:nrow(data_ML),k=10,returnTrain = FALSE)
+prev = matrix(0,nrow=nrow(data_ML),ncol=3) %>% as.data.frame()
+names(prev) = c('ridge','lasso','forest')
+
+for (k in 1:10){
+  train.X = data_ML_X[-folds[[k]],]
+  test.X = data_ML_X[folds[[k]],]
+  train.Y = data_ML_Y[-folds[[k]]]
+  
+  train = data_ML %>% slice(-folds[[k]])
+  test = data_ML %>% slice(folds[[k]])
+  
+  ridge.cv = cv.glmnet(train.X,train.Y,alpha = 0,family="binomial",lambda = exp(seq(-8,4,length=100)))
+  lasso.cv = cv.glmnet(train.X,train.Y,alpha = 1,family="binomial",lambda = exp(seq(-8,4,length=100)))
+  forest.cv = ranger(Y~.,data=train,probability = TRUE)
+  
+  
+  prev[folds[[k]],1] = as.vector(predict(ridge.cv,newx=test.X,type='response'))
+  prev[folds[[k]],2] = as.vector(predict(lasso.cv,newx=test.X,type='response'))
+  prev[folds[[k]],3] = predict(forest.cv,data = test)[1]$predictions[,2]
+  
+}
+
+result = data.frame(prev,data_ML_Y)
+prev1 = result %>% gather(key = "Method", value ="score",-data_ML_Y) 
+
+prev1 %>% group_by(Method) %>% summarize(AUC = auc(data_ML_Y,score)) %>% arrange(desc(AUC))
+
+```
+
+
+```{r}
+ggplot(prev1) + aes(d=data_ML_Y,m=score,color=Method) + geom_roc() + theme_classic()
+
+```
+
+
+
+
+A verifier :
+
+
+```{r}
+prev1 %>% group_by(Method) %>% summarise(Err = mean(data_ML_Y != round(score))) %>% arrange(Err)
+
+
+```
+
+
+
+
+
+
+
+
+
+
